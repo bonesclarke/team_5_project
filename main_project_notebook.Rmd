@@ -1,0 +1,212 @@
+---
+title: "Data 602 Project - Team 5"
+author: "Ryan Clarke"
+date: "2026-09-18"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=False}
+library(aod)
+library(arrow)
+library(binom)
+#library(car)
+library(collapsibleTree)
+#library(dbplyr)
+library(dplyr)
+library(Ecdat)
+library(EnvStats)
+#library(faraway)
+library(ggformula)
+library(ggplot2)
+library(ggpubr)
+library(gmodels)
+library(gridExtra)
+library(htmltools)
+library(ISLR)
+library(knitr)
+library(lawstat)
+library(leaps)
+library(lmtest)
+library(MASS)
+library(markdown)
+library(mctest)
+library(mosaic)
+library(mdsr)
+library(mosaicData)
+#library(nycflights13)
+library(nycflights23)
+library(olsrr)
+#library(plyr)
+library(purrr)
+library(plotly)
+library(readr)
+library(resampledata)
+library(rmarkdown)
+library(rpart)
+library(rlang)
+library(rpart.plot)
+library(rvest)
+library(SDaA)
+library(shiny)
+library(stringi)
+library(tibble)
+library(tidyr)
+library(tidyselect)
+library(tinytex)
+library(yaml)
+library(shiny)
+library(aod)
+library(ROCR)
+library(pROC)
+library(GGally)
+library(mctest)
+library(readxl)
+```
+
+```{r}
+analyze_and_fill_missing_values <- function(
+  df, 
+  drop_threshold = 1, 
+  report_path = NULL, 
+  validate = TRUE 
+) {
+  
+  # 1. Compute missing counts (Single scan - mimics polars schema check)
+  n_rows <- nrow(df)
+  missing_counts_df <- tibble(
+    column = colnames(df),
+    dtype = sapply(df, function(x) mode(x)), # 'integer', 'numeric', 'character' approx Polars dtypes
+    n_missing = sapply(df, function(x) sum(is.na(x))) # Check for NA (covers NaN/Inf logic in R mostly)
+  )
+  
+  # R Specific: Check for numeric inf/nan specifically
+  float_columns <- which(!is.logical(missing_counts_df$column)) # Not a perfect check but approximates Polars numeric check
+  
+  # Better missing calculation including Float specific checks (Inf/Nan)
+  compute_missing_with_types <- function(col, df_col) {
+    v <- df_col[[1]]
+    is_na_v <- sum(is.na(v))
+    
+    if (is.numeric(v)) {
+      is_nan_inf_v <- sum(!is.finite(v & !is.na(v))) # Check for Inf or NaN
+      return(is_na_v + is_nan_inf_v)
+    }
+    return(is_na_v)
+  }
+  
+  # Re-calculate missing counts properly
+  missing_vals_df <- tibble(
+    column = names(df),
+    n_missing = sapply(df, function(x) compute_missing_with_types(names(df)[1], x)) 
+  )
+  
+  # Sort for reporting
+  report_summary <- missing_vals_df %>% 
+    arrange(desc(n_missing)) 
+  
+  # Write Report to CSV if provided
+  if (!is.null(report_path)) {
+    dir.create(dirname(report_path), recursive = TRUE, showWarnings = FALSE)
+    write.csv(report_summary, file.path(report_path), row.names = FALSE)
+  }
+  
+  # Filter out columns with more than threshold missing values
+  cols_to_drop <- report_summary$column[report_summary$n_missing > drop_threshold]
+  
+  if (length(cols_to_drop) > 0) {
+    df <- df %>% select(-all_of(cols_to_drop))
+    message(paste("Dropped columns with > drop_threshold missing:", length(cols_to_drop)))
+  }
+  
+  # 2. Fill Missing Values (Mimics fill logic based on dtype)
+  df_filled <- df
+  
+  # Float/Double Logic
+  for (col in names(df)) {
+    if (!is.logical(df[[col]])) { 
+      if (!is.numeric(df[[col]])) next 
+      # Check if we want to handle numeric as "Float" logic (fill Inf/Nan with 0)
+      # Only apply this if mode is 'double' not 'integer' ideally, but R doesn't distinguish strongly in vectors
+    }
+    
+    # Apply fill based on type detection using sapply
+    df_filled <- df_filled %>% 
+      mutate(
+        across(all_of(names(df)), ~ {
+          v <- .x
+          if (is.numeric(v)) {
+            # Handle Inf/Nan/NA -> 0
+            ifelse(is.infinite(v) | is.nan(v), 0, .x)
+          } else if (is.logical(v)) {
+            # Handle NA -> FALSE
+            as.integer(!!!ifelse(is.na(.x), TRUE, !!.x == TRUE)) # Convert back to logical
+            # Simple way: replace_na(FALSE) works for boolean logic
+          } else if (is.character(v)) {
+            # Handle NA -> "N/A"
+            .x[!is.na(.x)]
+          } else {
+            return(.x)
+          }
+        })
+      )
+  }
+  
+  # R Tidyverse Implementation for Filling using `across` is cleaner:
+  df <- df %>% 
+    mutate(
+      across(everything(), ~{
+        x <- .x
+        if (is.numeric(x)) {
+          return(ifelse(is.infinite(x) | is.nan(x) | is.na(x), 0, x))
+        } else if (is.logical(x)) {
+          return(ifelse(is.na(x), FALSE, x))
+        } else if (is.character(x)) {
+          return(ifelse(is.na(x), "N/A", x))
+        } else {
+          return(.x) # Unhandled dtype
+        }
+      })
+    )
+    
+  # 3. Validation Logic (Mimics validate step)
+  if (validate) {
+    remaining_missing <- sum(!is.na(df[[1]])) == 0 # Check for first column just as example
+    
+    # Re-check full columns for completeness
+    validation_report <- tibble(
+      col = names(df),
+      remaining_na = sapply(df, function(x) sum(is.na(x)))
+    ) %>% 
+      filter(remaining_na != 0) # Check which still have NA after fill
+    
+    if (nrow(validation_report) > 0) {
+      message("WARNING: Columns still contain missing values after filling:")
+      for (i in 1:nrow(validation_report)) {
+        msg <- paste("  - ", validation_report$col[i], ": ", 
+                     validation_report$remaining_na[i])
+        cat(msg)
+      }
+    } else {
+      message("Validation Passed: No missing values remaining.")
+    }
+    
+    # Stop if any remain (assert equivalent)
+    if (nrow(validation_report) > 0) {
+      stop("Assertion failed: Unfilled columns detected") 
+    }
+  }
+  
+  return(list(df = df, report_summary = report_summary))
+}
+```
+
+```{r}
+drop_columns <- function(df, cols_to_drop) {
+  # -all_of safely checks if column names exist in the dataframe before dropping
+  select(df, -all_of(cols_to_drop))
+}
+```
